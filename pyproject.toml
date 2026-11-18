@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shortsmith"
+version = "0.2.0"
+description = "Turn YouTube videos into captioned, hook-first vertical shorts with low-bandwidth processing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["yt-dlp>=2024.8.6", "faster-whisper>=1.0.3", "anthropic>=0.40.0", "fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
+
+[project.scripts]
+shortsmith = "shortsmith.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["shortsmith*"]
