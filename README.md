@@ -51,6 +51,10 @@ The CLI writes finished files to `output/<job-id>/`. The local web server binds 
 
 Set `ANTHROPIC_API_KEY` in the environment or `.env` to enable transcript-based Claude analysis. API use may incur charges. `SHORTSMITH_MODEL` overrides the model name. The transcript is sent to Anthropic for ranking and hook generation; the video itself is not sent to Anthropic.
 
+## YouTube sign-in checks
+
+YouTube sometimes blocks downloads with "Sign in to confirm you're not a bot", especially from datacenter networks. If that happens, export cookies from a browser where you are signed in to YouTube (see the [yt-dlp cookie docs](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)), then either set `SHORTSMITH_COOKIES` to the cookies file path in `.env`, or pass `--cookies <path>` to the CLI. Keep the cookies file private; never commit it.
+
 ## Notes and responsible use
 
 - This app does not upload content to TikTok or any other platform.

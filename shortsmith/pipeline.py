@@ -27,18 +27,39 @@ def load_dotenv() -> None:
 def validate_youtube_url(url: str) -> str:
     parsed = urlparse(url.strip())
     host = (parsed.hostname or "").lower().rstrip(".")
-    allowed = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com"}
+    allowed = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com"}
     if parsed.scheme not in {"http", "https"} or host not in allowed:
         raise ValueError("Please enter a valid YouTube video URL.")
     if host.endswith("youtu.be"):
         video_id = parsed.path.strip("/").split("/")[0]
     else:
         video_id = parse_qs(parsed.query).get("v", [""])[0]
-        if not video_id and parsed.path.startswith("/shorts/"):
-            video_id = parsed.path.split("/")[2] if len(parsed.path.split("/")) > 2 else ""
+        if not video_id:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live", "v"}:
+                video_id = parts[1]
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id or ""):
         raise ValueError("The URL must point to a single YouTube video, not a playlist or channel.")
     return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _cookies_file(explicit: str | None = None) -> str | None:
+    """Return a yt-dlp cookie file path, if one was configured and exists."""
+    candidate = explicit or os.getenv("SHORTSMITH_COOKIES")
+    if candidate and Path(candidate).is_file():
+        return candidate
+    return None
+
+
+def _friendly_download_error(exc: Exception) -> RuntimeError:
+    message = str(exc)
+    if "Sign in to confirm" in message or "bot" in message.lower():
+        return RuntimeError(
+            "YouTube asked for a sign-in check before this download. Export cookies from a browser "
+            "where you are signed in to YouTube (see yt-dlp's cookie docs), then set SHORTSMITH_COOKIES "
+            "to that cookies file, or pass --cookies, and try again."
+        )
+    return RuntimeError(message)
 
 
 def _run(command: list[str], *, progress: Callable[[str], None] | None = None) -> None:
@@ -59,11 +80,11 @@ def _safe_stem(text: str, fallback: str) -> str:
     return (stem[:48].strip("-") or fallback)
 
 
-def download_audio(url: str, work_dir: Path) -> Path:
+def download_audio(url: str, work_dir: Path, cookies: str | None = None) -> Path:
     from yt_dlp import YoutubeDL
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    options = {
+    options: dict[str, Any] = {
         "format": "bestaudio/best",
         "outtmpl": str(work_dir / "source_audio.%(ext)s"),
         "noplaylist": True,
@@ -73,13 +94,19 @@ def download_audio(url: str, work_dir: Path) -> Path:
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "5"}],
         "postprocessor_args": {"ffmpeg": ["-ac", "1", "-ar", "16000"]},
     }
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = info.get("title") or "youtube-video"
+    cookiefile = _cookies_file(cookies)
+    if cookiefile:
+        options["cookiefile"] = cookiefile
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title") or "youtube-video"
+    except Exception as exc:
+        raise _friendly_download_error(exc) from exc
     wav = work_dir / "source_audio.wav"
     if not wav.exists():
         # Some source codecs may not use the expected postprocessor output name.
-        audio_files = list(work_dir.glob("source_audio.*"))
+        audio_files = [p for p in work_dir.glob("source_audio.*") if p.suffix.lower() not in {".part", ".ytdl", ".temp"}]
         if not audio_files:
             raise RuntimeError("YouTube audio download completed but no audio file was created.")
         _run(["ffmpeg", "-y", "-i", str(audio_files[0]), "-vn", "-ac", "1", "-ar", "16000", str(wav)])
@@ -223,12 +250,24 @@ def write_ass(path: Path, clip: dict[str, Any], segments: list[dict[str, Any]], 
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
 
-def download_section(url: str, clip: dict[str, Any], destination: Path, max_height: int = 480) -> Path:
+def _probe_duration(path: Path) -> float | None:
+    """Return a media file's duration in seconds, or None when ffprobe cannot read it."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=False,
+        )
+        return float(result.stdout.strip())
+    except (OSError, ValueError):
+        return None
+
+
+def download_section(url: str, clip: dict[str, Any], destination: Path, max_height: int = 480, cookies: str | None = None) -> Path:
     from yt_dlp import YoutubeDL
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     section = f"*{max(0, clip['start']):.3f}-{clip['end']:.3f}"
-    options = {
+    options: dict[str, Any] = {
         "format": f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best",
         "outtmpl": str(destination.with_suffix(".source.%(ext)s")),
         "download_sections": [section],
@@ -238,15 +277,31 @@ def download_section(url: str, clip: dict[str, Any], destination: Path, max_heig
         "no_warnings": True,
         "overwrites": True,
         "merge_output_format": "mp4",
-        "postprocessor_args": {"ffmpeg": ["-ss", str(clip["start"]), "-t", str(clip["end"] - clip["start"])]},
     }
-    with YoutubeDL(options) as ydl:
-        ydl.download([url])
-    matches = list(destination.parent.glob(destination.stem + ".source.*"))
-    matches = [p for p in matches if p.suffix.lower() not in {".part", ".ytdl"}]
+    # NOTE: do not add postprocessor_args with -ss/-t here. yt-dlp appends
+    # postprocessor ffmpeg args to every ffmpeg invocation, including the
+    # merger that runs on the already-cut section file (which starts near
+    # time 0), so an absolute -ss would seek past the end of the clip and
+    # produce an empty or truncated file. download_sections plus
+    # force_keyframes_at_cuts already performs the cut; render_clip trims
+    # the result to the exact requested duration.
+    cookiefile = _cookies_file(cookies)
+    if cookiefile:
+        options["cookiefile"] = cookiefile
+    try:
+        with YoutubeDL(options) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        raise _friendly_download_error(exc) from exc
+    matches = [p for p in destination.parent.glob(destination.stem + ".source.*") if p.suffix.lower() not in {".part", ".ytdl", ".temp"}]
     if not matches:
         raise RuntimeError("Could not find the downloaded clip section.")
-    return matches[0]
+    source = max(matches, key=lambda p: p.stat().st_size)
+    expected = clip["end"] - clip["start"]
+    actual = _probe_duration(source)
+    if actual is not None and actual < expected * 0.5:
+        raise RuntimeError(f"The downloaded section is only {actual:.1f}s, but {expected:.1f}s was requested. YouTube may have blocked part of the download; try again or use cookies (SHORTSMITH_COOKIES).")
+    return source
 
 
 def render_clip(source: Path, output: Path, subtitle_file: Path, duration: float) -> None:
@@ -258,7 +313,7 @@ def render_clip(source: Path, output: Path, subtitle_file: Path, duration: float
     _run(command)
 
 
-def process_video(url: str, output_root: Path, clips: int = 3, min_seconds: int = 20, max_seconds: int = 59, whisper_model: str = "base", language: str | None = None, use_llm: bool = True, progress: Callable[[str], None] | None = None, job_id: str | None = None) -> list[dict[str, Any]]:
+def process_video(url: str, output_root: Path, clips: int = 3, min_seconds: int = 20, max_seconds: int = 59, whisper_model: str = "base", language: str | None = None, use_llm: bool = True, progress: Callable[[str], None] | None = None, job_id: str | None = None, cookies: str | None = None) -> list[dict[str, Any]]:
     _require_tools()
     url = validate_youtube_url(url)
     if not 1 <= clips <= 5:
@@ -272,7 +327,7 @@ def process_video(url: str, output_root: Path, clips: int = 3, min_seconds: int 
             progress(text)
 
     say("Downloading audio only for transcription…")
-    audio = download_audio(url, work_dir)
+    audio = download_audio(url, work_dir, cookies=cookies)
     say("Transcribing locally… (the first run may download a Whisper model)")
     transcript, duration = transcribe(audio, whisper_model, language)
     candidates = find_candidates(transcript, duration, min_seconds, max_seconds)
@@ -286,7 +341,7 @@ def process_video(url: str, output_root: Path, clips: int = 3, min_seconds: int 
         stem = f"{i:02d}-{_safe_stem(clip['hook'], f'clip-{i}')}"
         output = work_dir / f"{stem}.mp4"
         subtitles = work_dir / f"{stem}.ass"
-        source = download_section(url, clip, work_dir / f"{stem}.mp4")
+        source = download_section(url, clip, work_dir / f"{stem}.mp4", cookies=cookies)
         write_ass(subtitles, clip, transcript)
         render_clip(source, output, subtitles, clip["end"] - clip["start"])
         source.unlink(missing_ok=True)

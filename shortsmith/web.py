@@ -6,7 +6,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -29,7 +29,9 @@ class JobRequest(BaseModel):
     min_seconds: int = Field(default=20, ge=10, le=60)
     max_seconds: int = Field(default=59, ge=10, le=60)
     whisper_model: str = Field(default_factory=lambda: os.getenv("SHORTSMITH_WHISPER_MODEL", "base"))
-    language: str | None = None
+    # Optional[...] (not `str | None`): Pydantic evaluates model annotations at
+    # class creation, and `str | None` fails on Python 3.9, the minimum supported.
+    language: Optional[str] = None
     use_llm: bool = True
 
 
